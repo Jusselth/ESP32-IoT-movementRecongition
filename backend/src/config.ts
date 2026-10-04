@@ -1,29 +1,38 @@
 import dotenv from 'dotenv';
 import path from 'path';
 
-// Cargar variables de entorno desde el archivo .env
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 export interface AppConfig {
-  PORT: number;
-  SMTP_HOST: string;
-  SMTP_PORT: number;
-  SMTP_SECURE: boolean;
-  SMTP_USER: string;
-  SMTP_PASS: string;
-  SMTP_FROM: string;
-  SMTP_TO: string;
+  port: number;
+  nodeEnv: string;
+  smtp: {
+    host: string;
+    port: number;
+    user: string;
+    pass: string;
+    from: string;
+  };
+  alertRecipient: string;
+  supabase: {
+    url: string;
+    key: string;
+  };
 }
 
 export const config: AppConfig = {
-  PORT: parseInt(process.env.PORT || '3000', 10),
-  SMTP_HOST: process.env.SMTP_HOST || 'smtp.gmail.com',
-  SMTP_PORT: parseInt(process.env.SMTP_PORT || '587', 10),
-  SMTP_SECURE: process.env.SMTP_SECURE === 'true',
-  SMTP_USER: process.env.SMTP_USER || '',
-  SMTP_PASS: process.env.SMTP_PASS || '',
-  SMTP_FROM: process.env.SMTP_FROM || process.env.SMTP_USER || 'alert@iot-security.com',
-  SMTP_TO: process.env.SMTP_TO || '',
+  port: parseInt(process.env.PORT || '3000', 10),
+  nodeEnv: process.env.NODE_ENV || 'development',
+  smtp: {
+    host: process.env.SMTP_HOST || 'smtp.gmail.com',
+    port: parseInt(process.env.SMTP_PORT || '587', 10),
+    user: process.env.SMTP_USER || '',
+    pass: process.env.SMTP_PASS || '',
+    from: process.env.EMAIL_FROM || '',
+  },
+  alertRecipient: process.env.ALERT_RECIPIENT_EMAIL || '',
+  supabase: {
+    url: process.env.SUPABASE_URL || '',
+    key: process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || '',
+  },
 };
-
-export default config;

@@ -3,7 +3,16 @@ import http from 'http';
 import cors from 'cors';
 import { Server, Socket } from 'socket.io';
 import { config } from './config';
-import { sendAlertEmail } from './services/email';
+import { sendIntrusionAlertEmail } from './services/email';
+import {
+  fetchSystemStatusFromDb,
+  saveSystemStatusToDb,
+  fetchScheduleConfigFromDb,
+  saveScheduleConfigToDb,
+  insertIntrusionLogToDb,
+  updateIntrusionLogEmailStatusDb,
+  fetchIntrusionLogsFromDb,
+} from './services/db';
 import {
   SystemState,
   TriggerSource,
@@ -22,7 +31,7 @@ import {
 } from '../../shared/types';
 
 // ============================================================================
-// 1. ESTADO GLOBAL EN MEMORIA
+// 1. ESTADO GLOBAL EN MEMORIA (CACHE)
 // ============================================================================
 
 let currentSystemState: SystemState = 'DISARMED';
@@ -36,10 +45,8 @@ let scheduleConfig: ScheduleConfig = {
   activeDays: ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY'],
 };
 
-const intrusionLogs: IntrusionLog[] = [];
-
 // ============================================================================
-// 2. FUNCIONES AUXILIARES DE LÓGICA Y HORARIOS
+// 2. FUNCIONES AUXILIARES Y DE SINCRONIZACIÓN
 // ============================================================================
 
 const DAYS_MAP: Record<number, DayOfWeek> = {
@@ -52,19 +59,13 @@ const DAYS_MAP: Record<number, DayOfWeek> = {
   6: 'SATURDAY',
 };
 
-/**
- * Valida si la fecha/hora actual se encuentra dentro de la franja horaria programada.
- */
 export function checkIsWithinSchedule(sched: ScheduleConfig, date: Date = new Date()): boolean {
-  if (!sched.enabled) {
-    return false;
-  }
+  if (!sched.enabled) return false;
 
   const dayOfWeek = DAYS_MAP[date.getDay()];
   if (!dayOfWeek) return false;
 
   const currentMinutes = date.getHours() * 60 + date.getMinutes();
-
   const [startH, startM] = sched.startTime.split(':').map(Number);
   const [endH, endM] = sched.endTime.split(':').map(Number);
 
@@ -76,17 +77,11 @@ export function checkIsWithinSchedule(sched: ScheduleConfig, date: Date = new Da
   const endMinutes = endH * 60 + endM;
 
   if (startMinutes <= endMinutes) {
-    // Franja dentro del mismo día (ej: 08:00 a 18:00)
-    const isTimeInWindow = currentMinutes >= startMinutes && currentMinutes <= endMinutes;
-    return isTimeInWindow && sched.activeDays.includes(dayOfWeek);
+    return currentMinutes >= startMinutes && currentMinutes <= endMinutes && sched.activeDays.includes(dayOfWeek);
   } else {
-    // Franja nocturna que cruza la medianoche (ej: 22:00 a 06:00)
     if (currentMinutes >= startMinutes) {
-      // Estamos en la noche del día actual
       return sched.activeDays.includes(dayOfWeek);
     } else if (currentMinutes <= endMinutes) {
-      // Estamos en la madrugada del día siguiente.
-      // Verificar si el día anterior estaba en activeDays
       const previousDayNum = (date.getDay() + 6) % 7;
       const previousDay = DAYS_MAP[previousDayNum];
       return previousDay ? sched.activeDays.includes(previousDay) : false;
@@ -96,9 +91,6 @@ export function checkIsWithinSchedule(sched: ScheduleConfig, date: Date = new Da
   return false;
 }
 
-/**
- * Genera la estructura del estado actual del sistema.
- */
 export function getSystemStatus(): SystemStatus {
   return {
     state: currentSystemState,
@@ -108,15 +100,17 @@ export function getSystemStatus(): SystemStatus {
   };
 }
 
-/**
- * Cambia el estado global del sistema y notifica a los clientes vía Socket.IO.
- */
-export function updateSystemState(newState: SystemState, source: string): SystemStatus {
+export async function updateSystemState(newState: SystemState, source: string): Promise<SystemStatus> {
   currentSystemState = newState;
   lastUpdatedStateTime = new Date().toISOString();
   lastUpdatedStateBy = source;
 
   const updatedStatus = getSystemStatus();
+
+  // Persistir en Supabase
+  await saveSystemStatusToDb(newState, source);
+
+  // Emitir evento por Socket.IO
   io.emit('system:status_changed', updatedStatus);
   console.log(`[SystemState] 🔄 Estado cambiado a: ${newState} por: ${source}`);
   return updatedStatus;
@@ -136,18 +130,14 @@ const io = new Server<ClientToServerEvents, ServerToClientEvents>(server, {
   },
 });
 
-// Middlewares Express (Límite alto de payload para imágenes Base64)
 app.use(cors());
-app.use(express.json({ limit: '15mb' }));
-app.use(express.urlencoded({ extended: true, limit: '15mb' }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // ============================================================================
 // 4. ENDPOINTS API REST
 // ============================================================================
 
-/**
- * GET /api/status - Obtiene el estado actual del sistema.
- */
 app.get('/api/status', (_req: Request, res: Response) => {
   const response: ApiResponse<SystemStatus> = {
     success: true,
@@ -157,12 +147,9 @@ app.get('/api/status', (_req: Request, res: Response) => {
   res.json(response);
 });
 
-/**
- * POST /api/status - Cambia el estado del sistema (ARMED | DISARMED | TRIGGERED).
- */
-app.post('/api/status', (req: Request, res: Response) => {
+app.post('/api/status', async (req: Request, res: Response) => {
   const body: UpdateStatusDto = req.body;
-  
+
   if (!body || !body.state || !['ARMED', 'DISARMED', 'TRIGGERED'].includes(body.state)) {
     const errorResponse: ApiResponse<null> = {
       success: false,
@@ -173,7 +160,7 @@ app.post('/api/status', (req: Request, res: Response) => {
     return;
   }
 
-  const updated = updateSystemState(body.state, body.source || 'REST_API');
+  const updated = await updateSystemState(body.state, body.source || 'REST_API');
 
   const response: ApiResponse<SystemStatus> = {
     success: true,
@@ -183,9 +170,6 @@ app.post('/api/status', (req: Request, res: Response) => {
   res.json(response);
 });
 
-/**
- * GET /api/schedule - Obtiene la configuración de franja horaria.
- */
 app.get('/api/schedule', (_req: Request, res: Response) => {
   const response: ApiResponse<ScheduleConfig> = {
     success: true,
@@ -195,10 +179,7 @@ app.get('/api/schedule', (_req: Request, res: Response) => {
   res.json(response);
 });
 
-/**
- * POST /api/schedule - Actualiza la configuración de franja horaria.
- */
-app.post('/api/schedule', (req: Request, res: Response) => {
+app.post('/api/schedule', async (req: Request, res: Response) => {
   const body: UpdateScheduleDto = req.body;
 
   if (!body || !body.schedule) {
@@ -212,9 +193,10 @@ app.post('/api/schedule', (req: Request, res: Response) => {
   }
 
   scheduleConfig = { ...body.schedule };
+  await saveScheduleConfigToDb(scheduleConfig);
   io.emit('system:schedule_updated', scheduleConfig);
 
-  console.log('[Schedule] 📅 Franja horaria actualizada:', scheduleConfig);
+  console.log('[Schedule] 📅 Franja horaria actualizada y guardada:', scheduleConfig);
 
   const response: ApiResponse<ScheduleConfig> = {
     success: true,
@@ -224,9 +206,6 @@ app.post('/api/schedule', (req: Request, res: Response) => {
   res.json(response);
 });
 
-/**
- * POST /api/alert - Reporta una alerta de intrusión con evidencia fotográfica.
- */
 app.post('/api/alert', async (req: Request, res: Response) => {
   const body: ReportAlertDto = req.body;
 
@@ -235,37 +214,44 @@ app.post('/api/alert', async (req: Request, res: Response) => {
 
   console.log(`[Alert] 🚨 Alerta reportada desde: ${triggerSource}`);
 
-  // Cambiar estado del sistema a TRIGGERED si no lo está
-  updateSystemState('TRIGGERED', triggerSource);
+  await updateSystemState('TRIGGERED', triggerSource);
 
-  // Crear registro de log de la intrusión
   const alertId = `alert_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-  
+
+  // Formatear Base64 COMPLETO sin recortar
+  let formattedEvidenceUrl: string | undefined = undefined;
+  if (body.imageBase64) {
+    const sanitized = body.imageBase64.trim().replace(/[\r\n]/g, '');
+    formattedEvidenceUrl = sanitized.startsWith('data:image')
+      ? sanitized
+      : `data:image/jpeg;base64,${sanitized}`;
+  }
+
+  const recipientEmail = config.alertRecipient || (config as any).email?.recipient || '';
+
   const intrusionLog: IntrusionLog = {
     id: alertId,
     timestamp: alertTimestamp,
     triggerSource,
-    evidenceUrl: body.imageBase64 ? `data:image/jpeg;base64,${body.imageBase64.substring(0, 30)}...` : undefined,
+    evidenceUrl: formattedEvidenceUrl, // 👈 Cadena Base64 completa guardada en DB y emitida por Sockets
     emailSent: false,
-    emailRecipient: config.SMTP_TO,
+    emailRecipient: recipientEmail,
     notes: body.additionalInfo,
   };
 
-  intrusionLogs.unshift(intrusionLog);
+  // Insertar en Supabase
+  await insertIntrusionLogToDb(intrusionLog);
 
-  // Intentar enviar correo electrónico de alerta en segundo plano
-  sendAlertEmail({
-    imageBase64: body.imageBase64,
-    timestamp: alertTimestamp,
-    triggerSource,
-    additionalInfo: body.additionalInfo,
-  }).then((emailSuccess) => {
-    intrusionLog.emailSent = emailSuccess;
-  }).catch((err) => {
-    console.error('[Alert] Error inesperado en envío de email:', err);
-  });
+  // Enviar correo de alerta
+  sendIntrusionAlertEmail(intrusionLog, body)
+    .then(async (emailSuccess: boolean) => {
+      intrusionLog.emailSent = emailSuccess;
+      await updateIntrusionLogEmailStatusDb(alertId, emailSuccess);
+    })
+    .catch((err: unknown) => {
+      console.error('[Alert] Error inesperado en envío de email:', err);
+    });
 
-  // Notificar a todos los clientes conectados vía Socket.IO
   io.emit('alert:triggered', intrusionLog);
 
   const response: ApiResponse<{ alertId: string }> = {
@@ -277,13 +263,11 @@ app.post('/api/alert', async (req: Request, res: Response) => {
   res.status(200).json(response);
 });
 
-/**
- * GET /api/logs - Consulta el historial de alertas e intrusiones.
- */
-app.get('/api/logs', (_req: Request, res: Response) => {
+app.get('/api/logs', async (_req: Request, res: Response) => {
+  const logsFromDb = await fetchIntrusionLogsFromDb();
   const response: ApiResponse<IntrusionLog[]> = {
     success: true,
-    data: intrusionLogs,
+    data: logsFromDb,
     timestamp: new Date().toISOString(),
   };
   res.json(response);
@@ -296,14 +280,12 @@ app.get('/api/logs', (_req: Request, res: Response) => {
 io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>) => {
   console.log(`[Socket.IO] 🔌 Cliente conectado: ${socket.id}`);
 
-  // Enviar estado inicial y configuración al cliente recién conectado
   socket.emit('system:status_changed', getSystemStatus());
   socket.emit('system:schedule_updated', scheduleConfig);
 
-  // Evento client:set_status
-  socket.on('client:set_status', (dto: UpdateStatusDto, callback?: (res: ApiResponse<SystemStatus>) => void) => {
+  socket.on('client:set_status', async (dto: UpdateStatusDto, callback?: (res: ApiResponse<SystemStatus>) => void) => {
     console.log(`[Socket.IO] 📩 Solicitud client:set_status ->`, dto);
-    const newStatus = updateSystemState(dto.state, dto.source || `SOCKET_${socket.id.substring(0, 5)}`);
+    const newStatus = await updateSystemState(dto.state, dto.source || `SOCKET_${socket.id.substring(0, 5)}`);
 
     if (callback) {
       callback({
@@ -314,23 +296,19 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
     }
   });
 
-  // Evento esp32:telemetry
-  socket.on('esp32:telemetry', (telemetry: ESP32Telemetry) => {
+  socket.on('esp32:telemetry', async (telemetry: ESP32Telemetry) => {
     console.log(`[ESP32 Telemetry] IP: ${telemetry.ipAddress} | RSSI: ${telemetry.wifiRssi}dBm | Heap: ${telemetry.freeHeap}B`);
 
-    // Si el botón físico fue presionado, conmutar estado (ARMED <-> DISARMED)
     if (telemetry.buttonPressed) {
       const nextState: SystemState = currentSystemState === 'DISARMED' ? 'ARMED' : 'DISARMED';
-      updateSystemState(nextState, 'ESP32_BUTTON');
+      await updateSystemState(nextState, 'ESP32_BUTTON');
     }
   });
 
-  // Evento mobile:heartbeat
   socket.on('mobile:heartbeat', (data: MobileHeartbeat) => {
     console.log(`[Mobile Heartbeat] Batería: ${data.batteryLevel}% | ServiceActive: ${data.isForegroundServiceActive} | CameraReady: ${data.cameraReady}`);
   });
 
-  // Evento client:ping
   socket.on('client:ping', (ts: number) => {
     socket.emit('server:pong', ts);
   });
@@ -344,29 +322,43 @@ io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>)
 // 6. VERIFICADOR PERIÓDICO DE HORARIOS
 // ============================================================================
 
-setInterval(() => {
+setInterval(async () => {
   const status = getSystemStatus();
-  // Si está desarmado pero estamos dentro de horario programado, se podría auto-armar si está configurado
   if (scheduleConfig.enabled && status.isWithinSchedule && currentSystemState === 'DISARMED') {
     console.log('[AutoArm] ⏰ Horario activo detectado. Auto-armando sistema...');
-    updateSystemState('ARMED', 'SCHEDULE_AUTO');
+    await updateSystemState('ARMED', 'SCHEDULE_AUTO');
   }
-}, 60000); // Cada 60 segundos
+}, 60000);
 
 // ============================================================================
-// 7. INICIO DEL SERVIDOR
+// 7. INICIALIZACIÓN DE DATOS Y ARRANQUE
 // ============================================================================
 
-const PORT = config.PORT;
+async function startServer() {
+  console.log('🔄 Sincronizando datos desde Supabase...');
 
-server.listen(PORT, () => {
-  console.log(`
+  const statusDb = await fetchSystemStatusFromDb();
+  currentSystemState = statusDb.state;
+  lastUpdatedStateTime = statusDb.lastUpdated;
+  lastUpdatedStateBy = statusDb.updatedBy;
+
+  scheduleConfig = await fetchScheduleConfigFromDb();
+
+  const PORT = config.port;
+  const recipientEmail = config.alertRecipient || (config as any).email?.recipient || '(No configurado)';
+
+  server.listen(PORT, () => {
+    console.log(`
 =====================================================
 🚀 Backend Servidor IoT iniciado exitosamente
 📡 Puerto HTTP/Socket.IO: ${PORT}
-📧 Correo Destino Alertas: ${config.SMTP_TO || '(No configurado)'}
+📧 Correo Destino Alertas: ${recipientEmail}
+🛢️ Persistencia: Supabase PostgreSQL Conectado
 =====================================================
-  `);
-});
+    `);
+  });
+}
+
+startServer();
 
 export { app, server, io };
