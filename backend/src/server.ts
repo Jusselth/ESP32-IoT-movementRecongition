@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import http from 'http';
 import cors from 'cors';
 import { Server, Socket } from 'socket.io';
+import { WebSocketServer, WebSocket } from 'ws';
 import { config } from './config';
 import { sendIntrusionAlertEmail } from './services/email';
 import {
@@ -110,26 +111,82 @@ export async function updateSystemState(newState: SystemState, source: string): 
   // Persistir en Supabase
   await saveSystemStatusToDb(newState, source);
 
-  // Emitir evento por Socket.IO
+  // Emitir a clientes Socket.IO (App Móvil)
   io.emit('system:status_changed', updatedStatus);
+
+  // Broadcast a clientes WebSocket Nativo (ESP32)
+  const espMessage = JSON.stringify({
+    type: 'status_changed',
+    state: newState,
+    updatedBy: source,
+    timestamp: lastUpdatedStateTime,
+  });
+
+  espWss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(espMessage);
+    }
+  });
+
   console.log(`[SystemState] 🔄 Estado cambiado a: ${newState} por: ${source}`);
   return updatedStatus;
 }
 
 // ============================================================================
-// 3. CONFIGURACIÓN DEL SERVIDOR EXPRESS Y SOCKET.IO
+// 3. CONFIGURACIÓN DEL SERVIDOR EXPRESS, SOCKET.IO Y WEBSOCKET NATIVO ESP32
 // ============================================================================
 
 const app = express();
 const server = http.createServer(app);
 
+// Socket.IO para App Móvil
 const io = new Server<ClientToServerEvents, ServerToClientEvents>(server, {
   cors: {
     origin: '*',
     methods: ['GET', 'POST'],
   },
-  allowEIO3: true, // 👈 Permite la negociación con clientes WebSocket de Arduino/ESP32
-  transports: ['websocket', 'polling'], // 👈 Permite la conexión WebSocket directa
+});
+
+// WebSocket Nativo para ESP32
+const espWss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (request, socket, head) => {
+  const pathname = request.url;
+
+  if (pathname === '/ws/esp32') {
+    espWss.handleUpgrade(request, socket, head, (ws) => {
+      espWss.emit('connection', ws, request);
+    });
+  }
+});
+
+espWss.on('connection', (ws: WebSocket) => {
+  console.log('[ESP32 Native WS] 🔌 ESP32 Conectado por WebSocket Nativo');
+
+  // Enviar estado actual al conectar
+  ws.send(JSON.stringify({
+    type: 'status_changed',
+    state: currentSystemState,
+    updatedBy: lastUpdatedStateBy,
+  }));
+
+  ws.on('message', async (message: string) => {
+    try {
+      const data = JSON.parse(message.toString());
+      console.log('[ESP32 Native WS] 📩 Mensaje recibido:', data);
+
+      if (data.buttonPressed) {
+        const nextState: SystemState = currentSystemState === 'DISARMED' ? 'ARMED' : 'DISARMED';
+        await updateSystemState(nextState, 'ESP32_BUTTON');
+      }
+    } catch (err) {
+      console.error('[ESP32 Native WS] Error parseando mensaje:', err);
+    }
+  });
+
+  ws.on('close', () => {
+    console.log('[ESP32 Native WS] 🔴 ESP32 Desconectado');
+  });
 });
 
 app.use(cors());
@@ -141,86 +198,45 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // ============================================================================
 
 app.get('/api/status', (_req: Request, res: Response) => {
-  const response: ApiResponse<SystemStatus> = {
-    success: true,
-    data: getSystemStatus(),
-    timestamp: new Date().toISOString(),
-  };
-  res.json(response);
+  res.json({ success: true, data: getSystemStatus(), timestamp: new Date().toISOString() });
 });
 
 app.post('/api/status', async (req: Request, res: Response) => {
   const body: UpdateStatusDto = req.body;
-
   if (!body || !body.state || !['ARMED', 'DISARMED', 'TRIGGERED'].includes(body.state)) {
-    const errorResponse: ApiResponse<null> = {
-      success: false,
-      error: 'Estado inválido. Debe ser ARMED, DISARMED o TRIGGERED.',
-      timestamp: new Date().toISOString(),
-    };
-    res.status(400).json(errorResponse);
+    res.status(400).json({ success: false, error: 'Estado inválido.', timestamp: new Date().toISOString() });
     return;
   }
-
   const updated = await updateSystemState(body.state, body.source || 'REST_API');
-
-  const response: ApiResponse<SystemStatus> = {
-    success: true,
-    data: updated,
-    timestamp: new Date().toISOString(),
-  };
-  res.json(response);
+  res.json({ success: true, data: updated, timestamp: new Date().toISOString() });
 });
 
 app.get('/api/schedule', (_req: Request, res: Response) => {
-  const response: ApiResponse<ScheduleConfig> = {
-    success: true,
-    data: scheduleConfig,
-    timestamp: new Date().toISOString(),
-  };
-  res.json(response);
+  res.json({ success: true, data: scheduleConfig, timestamp: new Date().toISOString() });
 });
 
 app.post('/api/schedule', async (req: Request, res: Response) => {
   const body: UpdateScheduleDto = req.body;
-
   if (!body || !body.schedule) {
-    const errorResponse: ApiResponse<null> = {
-      success: false,
-      error: 'Payload incompleto. Se requiere el objeto schedule.',
-      timestamp: new Date().toISOString(),
-    };
-    res.status(400).json(errorResponse);
+    res.status(400).json({ success: false, error: 'Payload incompleto.', timestamp: new Date().toISOString() });
     return;
   }
-
   scheduleConfig = { ...body.schedule };
   await saveScheduleConfigToDb(scheduleConfig);
   io.emit('system:schedule_updated', scheduleConfig);
-
-  console.log('[Schedule] 📅 Franja horaria actualizada y guardada:', scheduleConfig);
-
-  const response: ApiResponse<ScheduleConfig> = {
-    success: true,
-    data: scheduleConfig,
-    timestamp: new Date().toISOString(),
-  };
-  res.json(response);
+  res.json({ success: true, data: scheduleConfig, timestamp: new Date().toISOString() });
 });
 
 app.post('/api/alert', async (req: Request, res: Response) => {
   const body: ReportAlertDto = req.body;
-
   const triggerSource: TriggerSource = body.triggerSource || 'MOBILE_CAMERA';
   const alertTimestamp = body.timestamp || new Date().toISOString();
 
   console.log(`[Alert] 🚨 Alerta reportada desde: ${triggerSource}`);
-
   await updateSystemState('TRIGGERED', triggerSource);
 
   const alertId = `alert_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-  // Formatear Base64 COMPLETO sin recortar
   let formattedEvidenceUrl: string | undefined = undefined;
   if (body.imageBase64) {
     const sanitized = body.imageBase64.trim().replace(/[\r\n]/g, '');
@@ -241,104 +257,58 @@ app.post('/api/alert', async (req: Request, res: Response) => {
     notes: body.additionalInfo,
   };
 
-  // Insertar en Supabase
   await insertIntrusionLogToDb(intrusionLog);
 
-  // Enviar correo de alerta
   sendIntrusionAlertEmail(intrusionLog, body)
     .then(async (emailSuccess: boolean) => {
       intrusionLog.emailSent = emailSuccess;
       await updateIntrusionLogEmailStatusDb(alertId, emailSuccess);
     })
     .catch((err: unknown) => {
-      console.error('[Alert] Error inesperado en envío de email:', err);
+      console.error('[Alert] Error en envío de email:', err);
     });
 
   io.emit('alert:triggered', intrusionLog);
-
-  const response: ApiResponse<{ alertId: string }> = {
-    success: true,
-    data: { alertId },
-    timestamp: new Date().toISOString(),
-  };
-
-  res.status(200).json(response);
+  res.status(200).json({ success: true, data: { alertId }, timestamp: new Date().toISOString() });
 });
 
 app.get('/api/logs', async (_req: Request, res: Response) => {
   const logsFromDb = await fetchIntrusionLogsFromDb();
-  const response: ApiResponse<IntrusionLog[]> = {
-    success: true,
-    data: logsFromDb,
-    timestamp: new Date().toISOString(),
-  };
-  res.json(response);
+  res.json({ success: true, data: logsFromDb, timestamp: new Date().toISOString() });
 });
 
 // ============================================================================
-// 5. MANEJO DE EVENTOS SOCKET.IO
+// 5. MANEJO DE EVENTOS SOCKET.IO (APP MÓVIL)
 // ============================================================================
 
 io.on('connection', (socket: Socket<ClientToServerEvents, ServerToClientEvents>) => {
-  console.log(`[Socket.IO] 🔌 Cliente conectado: ${socket.id}`);
+  console.log(`[Socket.IO] 🔌 Cliente móvil conectado: ${socket.id}`);
 
   socket.emit('system:status_changed', getSystemStatus());
   socket.emit('system:schedule_updated', scheduleConfig);
 
   socket.on('client:set_status', async (dto: UpdateStatusDto, callback?: (res: ApiResponse<SystemStatus>) => void) => {
-    console.log(`[Socket.IO] 📩 Solicitud client:set_status ->`, dto);
     const newStatus = await updateSystemState(dto.state, dto.source || `SOCKET_${socket.id.substring(0, 5)}`);
-
     if (callback) {
-      callback({
-        success: true,
-        data: newStatus,
-        timestamp: new Date().toISOString(),
-      });
-    }
-  });
-
-  socket.on('esp32:telemetry', async (telemetry: ESP32Telemetry) => {
-    console.log(`[ESP32 Telemetry] IP: ${telemetry.ipAddress} | RSSI: ${telemetry.wifiRssi}dBm | Heap: ${telemetry.freeHeap}B`);
-
-    if (telemetry.buttonPressed) {
-      const nextState: SystemState = currentSystemState === 'DISARMED' ? 'ARMED' : 'DISARMED';
-      await updateSystemState(nextState, 'ESP32_BUTTON');
+      callback({ success: true, data: newStatus, timestamp: new Date().toISOString() });
     }
   });
 
   socket.on('mobile:heartbeat', (data: MobileHeartbeat) => {
-    console.log(`[Mobile Heartbeat] Batería: ${data.batteryLevel}% | ServiceActive: ${data.isForegroundServiceActive} | CameraReady: ${data.cameraReady}`);
-  });
-
-  socket.on('client:ping', (ts: number) => {
-    socket.emit('server:pong', ts);
+    console.log(`[Mobile Heartbeat] Batería: ${data.batteryLevel}%`);
   });
 
   socket.on('disconnect', (reason) => {
-    console.log(`[Socket.IO] ❌ Cliente desconectado (${socket.id}): ${reason}`);
+    console.log(`[Socket.IO] ❌ Cliente móvil desconectado (${socket.id}): ${reason}`);
   });
 });
 
 // ============================================================================
-// 6. VERIFICADOR PERIÓDICO DE HORARIOS
-// ============================================================================
-
-setInterval(async () => {
-  const status = getSystemStatus();
-  if (scheduleConfig.enabled && status.isWithinSchedule && currentSystemState === 'DISARMED') {
-    console.log('[AutoArm] ⏰ Horario activo detectado. Auto-armando sistema...');
-    await updateSystemState('ARMED', 'SCHEDULE_AUTO');
-  }
-}, 60000);
-
-// ============================================================================
-// 7. INICIALIZACIÓN DE DATOS Y ARRANQUE
+// 6. INICIALIZACIÓN DEL SERVIDOR
 // ============================================================================
 
 async function startServer() {
   console.log('🔄 Sincronizando datos desde Supabase...');
-
   const statusDb = await fetchSystemStatusFromDb();
   currentSystemState = statusDb.state;
   lastUpdatedStateTime = statusDb.lastUpdated;
@@ -347,14 +317,12 @@ async function startServer() {
   scheduleConfig = await fetchScheduleConfigFromDb();
 
   const PORT = config.port;
-  const recipientEmail = config.alertRecipient || (config as any).email?.recipient || '(No configurado)';
-
   server.listen(PORT, () => {
     console.log(`
 =====================================================
 🚀 Backend Servidor IoT iniciado exitosamente
 📡 Puerto HTTP/Socket.IO: ${PORT}
-📧 Correo Destino Alertas: ${recipientEmail}
+🔌 Endpoint WebSocket ESP32: ws://localhost:${PORT}/ws/esp32
 🛢️ Persistencia: Supabase PostgreSQL Conectado
 =====================================================
     `);
