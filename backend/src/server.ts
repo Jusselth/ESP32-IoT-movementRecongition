@@ -128,6 +128,8 @@ const io = new Server<ClientToServerEvents, ServerToClientEvents>(server, {
     origin: '*',
     methods: ['GET', 'POST'],
   },
+  allowEIO3: true, // 👈 Permite la negociación con clientes WebSocket de Arduino/ESP32
+  transports: ['websocket', 'polling'], // 👈 Permite la conexión WebSocket directa
 });
 
 app.use(cors());
@@ -233,7 +235,7 @@ app.post('/api/alert', async (req: Request, res: Response) => {
     id: alertId,
     timestamp: alertTimestamp,
     triggerSource,
-    evidenceUrl: formattedEvidenceUrl, // 👈 Cadena Base64 completa guardada en DB y emitida por Sockets
+    evidenceUrl: formattedEvidenceUrl,
     emailSent: false,
     emailRecipient: recipientEmail,
     notes: body.additionalInfo,
