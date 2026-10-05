@@ -12,6 +12,8 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import { useSystemStore } from '../store/useSystemStore';
 import { SystemState } from '../../../shared/types';
 
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 export const CameraScreen = () => {
     const [permission, requestPermission] = useCameraPermissions();
     const cameraRef = useRef<CameraView>(null);
@@ -28,7 +30,7 @@ export const CameraScreen = () => {
     const reportAlert = useSystemStore((state) => state.reportAlert);
     const currentState: SystemState = status?.state || 'DISARMED';
 
-    // Función principal para reportar alertas
+    // Función principal para reportar alertas en ráfaga (3 imágenes a 0.5s)
     const triggerIntrusionDetection = async (reason = 'Detección automática de movimiento') => {
         if (isProcessing) return;
 
@@ -40,33 +42,46 @@ export const CameraScreen = () => {
             setIsProcessing(true);
 
             if (cameraRef.current) {
-                const photo = await cameraRef.current.takePictureAsync({
-                    base64: true,
-                    quality: 0.2,
-                    shutterSound: false,
-                });
+                const capturedImages: string[] = [];
 
-                if (photo?.base64) {
+                // Capturar 3 fotogramas consecutivos con 0.5s de pausa
+                for (let i = 0; i < 3; i++) {
+                    const photo = await cameraRef.current.takePictureAsync({
+                        base64: true,
+                        quality: 0.2,
+                        shutterSound: false,
+                    });
+
+                    if (photo?.base64) {
+                        const cleanBase64 = photo.base64.replace(/[\r\n]/g, '');
+                        capturedImages.push(cleanBase64);
+                        console.log(`[Camera Burst] 📸 Foto ${i + 1}/3 capturada`);
+                    }
+
+                    if (i < 2) {
+                        await delay(500); // Pausa de 500ms entre tomas
+                    }
+                }
+
+                if (capturedImages.length > 0) {
                     const timestamp = new Date().toISOString();
                     setLastCaptureTime(new Date().toLocaleTimeString());
-
-                    const cleanBase64 = photo.base64.replace(/[\r\n]/g, '');
 
                     await reportAlert({
                         triggerSource: 'MOBILE_CAMERA',
                         timestamp,
-                        imageBase64: cleanBase64,
-                        additionalInfo: reason,
+                        imagesBase64: capturedImages,          // Arreglo completo de ráfaga
+                        imageBase64: capturedImages[0],        // Respaldo de foto individual
+                        additionalInfo: `${reason} (Ráfaga de ${capturedImages.length} tomas a 0.5s)`,
                     });
                 }
             }
         } catch (error) {
-            console.error('[Camera] Error al capturar evidencia:', error);
+            console.error('[Camera] Error al capturar ráfaga de evidencia:', error);
         } finally {
             setIsProcessing(false);
         }
     };
-
 
     // Algoritmo de detección óptica automática corregido
     useEffect(() => {
@@ -97,8 +112,8 @@ export const CameraScreen = () => {
                             // Muestra el cambio detectado en la consola para calibrar
                             console.log(`[AutoDetect] 🔍 Nivel de movimiento detectado (Delta): ${delta}`);
 
-                            // Umbral calibrado (Valores > 567 indican movimiento frente al lente)
-                            if (delta > 567) {
+                            // Umbral calibrado (Valores > 600 indican movimiento frente al lente)
+                            if (delta > 600) {
                                 console.log(`[AutoDetect] 🚨 ¡Movimiento superó el umbral! Disparando alerta...`);
                                 previousFrameHashRef.current = null;
                                 await triggerIntrusionDetection('🚨 Movimiento óptico detectado automáticamente');
@@ -111,7 +126,7 @@ export const CameraScreen = () => {
                 } catch (err) {
                     // Ignorar pequeños fallos de ciclo
                 }
-            }, 1000);
+            }, 825);
         } else {
             previousFrameHashRef.current = null;
         }

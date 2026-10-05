@@ -27,7 +27,6 @@ import {
   ReportAlertDto,
   ServerToClientEvents,
   ClientToServerEvents,
-  ESP32Telemetry,
   MobileHeartbeat,
 } from '../../shared/types';
 
@@ -244,12 +243,16 @@ app.post('/api/alert', async (req: Request, res: Response) => {
 
   const alertId = `alert_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-  let formattedEvidenceUrl: string | undefined = undefined;
-  if (body.imageBase64) {
+  // Procesar arreglo de imágenes Base64 (admite ráfaga 'imagesBase64' o foto única 'imageBase64')
+  let formattedImages: string[] = [];
+  if (body.imagesBase64 && Array.isArray(body.imagesBase64) && body.imagesBase64.length > 0) {
+    formattedImages = body.imagesBase64.map((img) => {
+      const sanitized = img.trim().replace(/[\r\n]/g, '');
+      return sanitized.startsWith('data:image') ? sanitized : `data:image/jpeg;base64,${sanitized}`;
+    });
+  } else if (body.imageBase64) {
     const sanitized = body.imageBase64.trim().replace(/[\r\n]/g, '');
-    formattedEvidenceUrl = sanitized.startsWith('data:image')
-      ? sanitized
-      : `data:image/jpeg;base64,${sanitized}`;
+    formattedImages.push(sanitized.startsWith('data:image') ? sanitized : `data:image/jpeg;base64,${sanitized}`);
   }
 
   const recipientEmail = config.alertRecipient || (config as any).email?.recipient || '';
@@ -258,7 +261,8 @@ app.post('/api/alert', async (req: Request, res: Response) => {
     id: alertId,
     timestamp: alertTimestamp,
     triggerSource,
-    evidenceUrl: formattedEvidenceUrl,
+    evidenceUrl: formattedImages[0] || undefined, // Primera foto para vista rápida
+    evidenceUrls: formattedImages,                // Arreglo completo con la ráfaga de fotos
     emailSent: false,
     emailRecipient: recipientEmail,
     notes: body.additionalInfo,
@@ -266,6 +270,7 @@ app.post('/api/alert', async (req: Request, res: Response) => {
 
   await insertIntrusionLogToDb(intrusionLog);
 
+  // Transmitir el DTO con la ráfaga completa al servicio de correo
   sendIntrusionAlertEmail(intrusionLog, body)
     .then(async (emailSuccess: boolean) => {
       intrusionLog.emailSent = emailSuccess;
@@ -276,7 +281,11 @@ app.post('/api/alert', async (req: Request, res: Response) => {
     });
 
   io.emit('alert:triggered', intrusionLog);
-  res.status(200).json({ success: true, data: { alertId }, timestamp: new Date().toISOString() });
+  res.status(200).json({
+    success: true,
+    data: { alertId, imagesCaptured: formattedImages.length },
+    timestamp: new Date().toISOString(),
+  });
 });
 
 app.get('/api/logs', async (_req: Request, res: Response) => {
