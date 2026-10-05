@@ -97,8 +97,8 @@ export const CameraScreen = () => {
                             // Muestra el cambio detectado en la consola para calibrar
                             console.log(`[AutoDetect] 🔍 Nivel de movimiento detectado (Delta): ${delta}`);
 
-                            // Umbral calibrado (Valores > 600 indican movimiento frente al lente)
-                            if (delta > 500) {
+                            // Umbral calibrado (Valores > 567 indican movimiento frente al lente)
+                            if (delta > 567) {
                                 console.log(`[AutoDetect] 🚨 ¡Movimiento superó el umbral! Disparando alerta...`);
                                 previousFrameHashRef.current = null;
                                 await triggerIntrusionDetection('🚨 Movimiento óptico detectado automáticamente');
@@ -111,7 +111,7 @@ export const CameraScreen = () => {
                 } catch (err) {
                     // Ignorar pequeños fallos de ciclo
                 }
-            }, 2000);
+            }, 1000);
         } else {
             previousFrameHashRef.current = null;
         }
