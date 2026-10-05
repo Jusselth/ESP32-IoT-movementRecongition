@@ -77,9 +77,9 @@ export const useSystemStore = create<SystemStore>((set) => ({
             ]);
 
             set({
-                status: statusRes.data.data,
-                schedule: scheduleRes.data.data,
-                logs: logsRes.data.data,
+                status: statusRes.data.data || null,
+                schedule: scheduleRes.data.data || null,
+                logs: logsRes.data.data || [],
             });
         } catch (error) {
             console.error('[REST] Error al cargar datos iniciales:', error);

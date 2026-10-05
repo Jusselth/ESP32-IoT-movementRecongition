@@ -36,7 +36,8 @@ export interface IntrusionLog {
   id: string;
   timestamp: string;  // ISO Date String
   triggerSource: TriggerSource;
-  evidenceUrl?: string;
+  evidenceUrl?: string;     // Primera foto para vista rápida
+  evidenceUrls?: string[];  // Arreglo completo de ráfaga
   emailSent: boolean;
   emailRecipient?: string;
   notes?: string;
@@ -64,7 +65,8 @@ export interface UpdateScheduleDto {
 
 export interface ReportAlertDto {
   triggerSource: TriggerSource;
-  imageBase64?: string; // Fotografía capturada por la app en formato Base64
+  imageBase64?: string;   // Imagen individual (compatibilidad)
+  imagesBase64?: string[]; // Arreglo de la ráfaga de fotos en Base64
   timestamp: string;
   additionalInfo?: string;
 }
