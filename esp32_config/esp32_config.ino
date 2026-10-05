@@ -1,9 +1,9 @@
 /**
  * ============================================================================
- * FIRMWARE ESP32 - PROTAGONISTA IoT AVANZADO CON SOPORTE DE CÁMARA Y BUZZER
+ * FIRMWARE ESP32 - PROTAGONISTA IoT AVANZADO CON BOTÓN MULTI-GESTO
  * ============================================================================
  * Protocolo: WebSocket Nativo Directo (/ws/esp32)
- * Soporte: Botones físicos, Buzzer tonal, LED de estado y ESP32-CAM opcional.
+ * Hardware: Botón BOOT integrado (GPIO 0) con detección de pulsación corta/larga.
  * ============================================================================
  */
 
@@ -14,22 +14,21 @@
 // ============================================================================
 // 1. CONFIGURACIÓN DE RED Y BACKEND
 // ============================================================================
-const char* WIFI_SSID     = "TP-LINK_4F7E48";          // 👈 Reemplaza por tu red Wi-Fi
-const char* WIFI_PASSWORD = "03333129";   // 👈 Reemplaza por tu contraseña Wi-Fi
+const char* WIFI_SSID     = "Galaxy S26 Ultra Juss";   // 👈 Tu red Wi-Fi
+const char* WIFI_PASSWORD = "0123456789";            // 👈 Tu contraseña Wi-Fi
 
-// IP local de tu PC ejecutando el Backend (ej: 192.168.1.15)
-const char* SERVER_HOST   = "192.168.1.32";        // 👈 Reemplaza por la IP de tu PC
+const char* SERVER_HOST   = "10.181.175.123";         // 👈 Dirección IPv4 de tu PC
 const uint16_t SERVER_PORT = 3000;
 
 // ============================================================================
 // 2. CONFIGURACIÓN DE PINES Y HARDWARE
 // ============================================================================
 #define PIN_BUILTIN_LED 2    // LED Azul Integrado en la placa ESP32
-#define PIN_BUZZER      21   // Pin listo para conectar un Buzzer Pasivo/Activo
-#define PIN_BTN_ARM     4    // Pin listo para Botón Físico Armar/Desarmar (INPUT_PULLUP)
-#define PIN_BTN_PANIC   13   // Pin listo para Botón Físico de Pánico (INPUT_PULLUP)
+#define PIN_BUZZER      21   // Pin listo para conectar un Buzzer
+#define PIN_BOOT_BTN    0    // Botón BOOT integrado en la placa ESP32 (GPIO 0)
+#define PIN_BTN_ARM     4    // Pin listo para Botón Físico Externo Armar/Desarmar
+#define PIN_BTN_PANIC   13   // Pin listo para Botón Físico Externo de Pánico
 
-// Activar solo si se usa una placa ESP32-CAM (AI-Thinker OV2640)
 #define ENABLE_ESP32_CAM false
 
 #if ENABLE_ESP32_CAM
@@ -61,12 +60,20 @@ SystemState currentState = DISARMED;
 WebSocketsClient webSocket;
 bool isConnected = false;
 
-// Control de Anti-rebote para Botones Físicos (Debounce)
+// Variables para control del Botón BOOT integrado (GPIO 0)
+int bootBtnLastState = HIGH;
+unsigned long bootPressStartTime = 0;
+bool bootLongPressHandled = false;
+
+const unsigned long SHORT_PRESS_MAX_MS = 1200; // Máximo 1.2s para pulsación corta
+const unsigned long LONG_PRESS_MIN_MS  = 1500; // Mínimo 1.5s para pulsación larga (Pánico)
+const unsigned long DEBOUNCE_DELAY     = 50;   // Antirrebote mínimo
+
+// Control Anti-rebote para Botones Físicos Externos Opcionales (GPIO 4 y 13)
 int lastArmBtnState = HIGH;
 int lastPanicBtnState = HIGH;
 unsigned long lastDebounceTimeArm = 0;
 unsigned long lastDebounceTimePanic = 0;
-const unsigned long DEBOUNCE_DELAY = 50;
 
 // Temporizadores no bloqueantes
 unsigned long lastBlinkTime = 0;
@@ -88,17 +95,14 @@ void handleSerialCommands();
 // ============================================================================
 void playToneSound(String type) {
   if (type == "ARM") {
-    // Tono de Armado: Bip-Bip agudo
     tone(PIN_BUZZER, 1000, 100);
     delay(120);
     tone(PIN_BUZZER, 1500, 150);
   } else if (type == "DISARM") {
-    // Tono de Desarmado: Bip grave descendente
     tone(PIN_BUZZER, 800, 200);
     delay(220);
     tone(PIN_BUZZER, 400, 300);
   } else if (type == "PANIC") {
-    // Tono de Pánico de emergencia
     tone(PIN_BUZZER, 2000, 400);
   }
 }
@@ -129,13 +133,12 @@ void updateHardwareState(SystemState previousState) {
 void processTriggeredBlink() {
   if (currentState == TRIGGERED) {
     unsigned long currentMillis = millis();
-    if (currentMillis - lastBlinkTime >= 100) { // Parpadeo estroboscópico (100ms)
+    if (currentMillis - lastBlinkTime >= 100) {
       lastBlinkTime = currentMillis;
       blinkState = !blinkState;
 
       digitalWrite(PIN_BUILTIN_LED, blinkState ? HIGH : LOW);
       
-      // Sonido de sirena intermitente
       if (blinkState) {
         tone(PIN_BUZZER, 1800);
       } else {
@@ -175,7 +178,7 @@ void sendTelemetry(bool buttonPressed, bool panicPressed) {
   String output;
   serializeJson(doc, output);
   webSocket.sendTXT(output);
-  Serial.println("[ESP32 Telemetry] 📤 Telemetría enviada al servidor");
+  Serial.println("[ESP32 Telemetry] 📤 Evento enviado al servidor");
 }
 
 // ============================================================================
@@ -191,10 +194,9 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     case WStype_CONNECTED:
       Serial.printf("[ESP32 WS] 🟢 Conectado exitosamente a: %s\n", payload);
       Serial.println("\n-----------------------------------------------------");
-      Serial.println("💻 COMANDOS DISPONIBLES EN CONSOLA:");
-      Serial.println("  'b' -> Simular Botón Armar/Desarmar");
-      Serial.println("  't' -> Simular Botón de Pánico / Sensor de Movimiento");
-      Serial.println("  's' -> Mostrar Diagnóstico Completo del Hardware");
+      Serial.println("💻 MANEJO DEL BOTÓN 'BOOT' INTEGRADO (GPIO 0):");
+      Serial.println("  • Pulsación Corta (<1.2s) -> Armar / Desarmar");
+      Serial.println("  • Pulsación Larga (>1.5s) -> Botón de Pánico");
       Serial.println("-----------------------------------------------------\n");
       isConnected = true;
       sendTelemetry(false, false);
@@ -238,10 +240,45 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
 }
 
 // ============================================================================
-// 8. LECTURA Y MANEJO DE BOTONES FÍSICOS
+// 8. LECTURA Y MANEJO DE BOTONES FÍSICOS (GESTO CORTO / LARGO)
 // ============================================================================
 void handlePhysicalButtons() {
-  // 1. Botón Armar/Desarmar (GPIO 4)
+  // --------------------------------------------------------------------------
+  // A. BOTÓN INTEGRADO "BOOT" (GPIO 0) CON GESTOS POR TIEMPO DE PRESIONAL
+  // --------------------------------------------------------------------------
+  int bootReading = digitalRead(PIN_BOOT_BTN);
+
+  // Transición: Presionar botón (HIGH -> LOW)
+  if (bootReading == LOW && bootBtnLastState == HIGH) {
+    bootPressStartTime = millis();
+    bootLongPressHandled = false;
+  }
+
+  // Estado sostenido: Mantener presionado (LOW)
+  if (bootReading == LOW) {
+    unsigned long holdDuration = millis() - bootPressStartTime;
+    if (!bootLongPressHandled && holdDuration >= LONG_PRESS_MIN_MS) {
+      Serial.println("[ESP32 Hardware] 🚨 PULSACIÓN LARGA EN BOTÓN BOOT (GPIO 0) -> ¡PÁNICO!");
+      playToneSound("PANIC");
+      sendTelemetry(false, true); // Enviar Pánico
+      bootLongPressHandled = true; // Bloqueo para no repetir
+    }
+  }
+
+  // Transición: Soltar botón (LOW -> HIGH)
+  if (bootReading == HIGH && bootBtnLastState == LOW) {
+    unsigned long holdDuration = millis() - bootPressStartTime;
+    if (!bootLongPressHandled && holdDuration >= DEBOUNCE_DELAY && holdDuration < SHORT_PRESS_MAX_MS) {
+      Serial.println("[ESP32 Hardware] 🔘 PULSACIÓN CORTA EN BOTÓN BOOT (GPIO 0) -> Armar/Desarmar");
+      sendTelemetry(true, false); // Enviar Armar/Desarmar
+    }
+  }
+
+  bootBtnLastState = bootReading;
+
+  // --------------------------------------------------------------------------
+  // B. BOTONES EXTERNOS OPCIONALES (GPIO 4 y GPIO 13)
+  // --------------------------------------------------------------------------
   int armReading = digitalRead(PIN_BTN_ARM);
   if (armReading != lastArmBtnState) {
     lastDebounceTimeArm = millis();
@@ -250,15 +287,14 @@ void handlePhysicalButtons() {
     static int armBtnState = HIGH;
     if (armReading != armBtnState) {
       armBtnState = armReading;
-      if (armBtnState == LOW) { // Pulsado a GND
-        Serial.println("[ESP32 Hardware] 🔘 Botón físico (GPIO 4) presionado.");
+      if (armBtnState == LOW) {
+        Serial.println("[ESP32 Hardware] 🔘 Botón Externo GPIO 4 presionado.");
         sendTelemetry(true, false);
       }
     }
   }
   lastArmBtnState = armReading;
 
-  // 2. Botón de Pánico / Emergencia (GPIO 13)
   int panicReading = digitalRead(PIN_BTN_PANIC);
   if (panicReading != lastPanicBtnState) {
     lastDebounceTimePanic = millis();
@@ -267,8 +303,8 @@ void handlePhysicalButtons() {
     static int panicBtnState = HIGH;
     if (panicReading != panicBtnState) {
       panicBtnState = panicReading;
-      if (panicBtnState == LOW) { // Pulsado a GND
-        Serial.println("[ESP32 Hardware] 🚨 Botón de Pánico (GPIO 13) presionado.");
+      if (panicBtnState == LOW) {
+        Serial.println("[ESP32 Hardware] 🚨 Botón Externo GPIO 13 presionado.");
         sendTelemetry(false, true);
       }
     }
@@ -313,15 +349,14 @@ void setup() {
   Serial.println("🚀 Panel IoT ESP32 Avanzado Iniciando...");
   Serial.println("=====================================================");
 
-  // Configuración de Pines de Salida y Entrada
   pinMode(PIN_BUILTIN_LED, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_BOOT_BTN, INPUT_PULLUP); // Habilitar el botón BOOT de la placa
   pinMode(PIN_BTN_ARM, INPUT_PULLUP);
   pinMode(PIN_BTN_PANIC, INPUT_PULLUP);
 
   updateHardwareState(DISARMED);
 
-  // Conexión Wi-Fi
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("[Wi-Fi] Conectando a ");
   Serial.print(WIFI_SSID);
@@ -335,7 +370,6 @@ void setup() {
   Serial.print("[Wi-Fi] IP Asignada: ");
   Serial.println(WiFi.localIP());
 
-  // Iniciar cliente WebSocket
   webSocket.begin(SERVER_HOST, SERVER_PORT, "/ws/esp32");
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);

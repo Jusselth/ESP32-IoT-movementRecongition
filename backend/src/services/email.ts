@@ -54,7 +54,7 @@ export async function sendIntrusionAlertEmail(
       imagesHtml += `
         <div style="margin-top: 15px; text-align: center;">
           <p style="margin: 5px 0; color: #555; font-size: 13px; font-weight: bold;">
-            Fotograma ${index + 1} de ${rawImages.length} (Secuencia a 0.5s)
+            Fotograma ${index + 1} de ${rawImages.length} (Secuencia a 0.2s)
           </p>
           <img src="cid:${cidName}" alt="Evidencia ${index + 1}" style="max-width: 100%; height: auto; border: 1px solid #ccc; border-radius: 6px;" />
         </div>
