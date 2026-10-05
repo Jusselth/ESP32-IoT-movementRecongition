@@ -17,18 +17,22 @@ export const CameraScreen = () => {
     const cameraRef = useRef<CameraView>(null);
 
     const [isMonitoring, setIsMonitoring] = useState<boolean>(true);
+    const [isAutoDetectEnabled, setIsAutoDetectEnabled] = useState<boolean>(true);
     const [isProcessing, setIsProcessing] = useState<boolean>(false);
     const [lastCaptureTime, setLastCaptureTime] = useState<string | null>(null);
+
+    // Guardar hash del fotograma anterior para detectar movimiento
+    const previousFrameHashRef = useRef<number | null>(null);
 
     const status = useSystemStore((state) => state.status);
     const reportAlert = useSystemStore((state) => state.reportAlert);
     const currentState: SystemState = status?.state || 'DISARMED';
 
-    const triggerIntrusionDetection = async (reason = 'Detección de movimiento en lente de cámara') => {
+    // Función principal para reportar alertas
+    const triggerIntrusionDetection = async (reason = 'Detección automática de movimiento') => {
         if (isProcessing) return;
 
         if (currentState !== 'ARMED') {
-            console.log('[Camera] Captura ignorada: El sistema no está ARMADO.');
             return;
         }
 
@@ -36,7 +40,6 @@ export const CameraScreen = () => {
             setIsProcessing(true);
 
             if (cameraRef.current) {
-                // Captura comprimida a 0.2 para evitar recuadros negros en Android
                 const photo = await cameraRef.current.takePictureAsync({
                     base64: true,
                     quality: 0.2,
@@ -47,7 +50,6 @@ export const CameraScreen = () => {
                     const timestamp = new Date().toISOString();
                     setLastCaptureTime(new Date().toLocaleTimeString());
 
-                    // Sanitizar saltos de línea e itinerarios
                     const cleanBase64 = photo.base64.replace(/[\r\n]/g, '');
 
                     await reportAlert({
@@ -59,25 +61,65 @@ export const CameraScreen = () => {
                 }
             }
         } catch (error) {
-            console.error('[Camera] Error al capturar evidencia fotográfica:', error);
+            console.error('[Camera] Error al capturar evidencia:', error);
         } finally {
             setIsProcessing(false);
         }
     };
 
-    useEffect(() => {
-        let intervalId: NodeJS.Timeout | null = null;
 
-        if (currentState === 'ARMED' && isMonitoring) {
-            intervalId = setInterval(() => {
-                console.log('[Camera Sensor] Vigilancia activa ejecutándose...');
-            }, 5000);
+    // Algoritmo de detección óptica automática corregido
+    useEffect(() => {
+        let autoDetectInterval: NodeJS.Timeout | null = null;
+
+        if (currentState === 'ARMED' && isMonitoring && isAutoDetectEnabled) {
+            autoDetectInterval = setInterval(async () => {
+                if (isProcessing || !cameraRef.current) return;
+
+                try {
+                    const frame = await cameraRef.current.takePictureAsync({
+                        base64: true,
+                        quality: 0.1,
+                        shutterSound: false,
+                    });
+
+                    if (frame?.base64) {
+                        // Muestreo de la cadena Base64
+                        const sampleString = frame.base64.substring(200, 1200);
+                        let currentHash = 0;
+                        for (let i = 0; i < sampleString.length; i++) {
+                            currentHash += sampleString.charCodeAt(i);
+                        }
+
+                        if (previousFrameHashRef.current !== null) {
+                            const delta = Math.abs(currentHash - previousFrameHashRef.current);
+
+                            // Muestra el cambio detectado en la consola para calibrar
+                            console.log(`[AutoDetect] 🔍 Nivel de movimiento detectado (Delta): ${delta}`);
+
+                            // Umbral calibrado (Valores > 600 indican movimiento frente al lente)
+                            if (delta > 500) {
+                                console.log(`[AutoDetect] 🚨 ¡Movimiento superó el umbral! Disparando alerta...`);
+                                previousFrameHashRef.current = null;
+                                await triggerIntrusionDetection('🚨 Movimiento óptico detectado automáticamente');
+                                return;
+                            }
+                        }
+
+                        previousFrameHashRef.current = currentHash;
+                    }
+                } catch (err) {
+                    // Ignorar pequeños fallos de ciclo
+                }
+            }, 2000);
+        } else {
+            previousFrameHashRef.current = null;
         }
 
         return () => {
-            if (intervalId) clearInterval(intervalId);
+            if (autoDetectInterval) clearInterval(autoDetectInterval);
         };
-    }, [currentState, isMonitoring]);
+    }, [currentState, isMonitoring, isAutoDetectEnabled, isProcessing]);
 
     if (!permission) {
         return (
@@ -93,10 +135,10 @@ export const CameraScreen = () => {
             <View style={styles.centeredContainer}>
                 <Text style={styles.permissionTitle}>Permiso de Cámara Requerido</Text>
                 <Text style={styles.permissionDescription}>
-                    Esta aplicación necesita acceso a la cámara para operar como sensor de movimiento y capturar fotogramas de evidencia ante una intrusión.
+                    Acceso necesario para operar como sensor óptico de intrusiones.
                 </Text>
                 <TouchableOpacity style={styles.permissionButton} onPress={requestPermission}>
-                    <Text style={styles.permissionButtonText}>Otorgar Permiso de Cámara</Text>
+                    <Text style={styles.permissionButtonText}>Otorgar Permiso</Text>
                 </TouchableOpacity>
             </View>
         );
@@ -104,11 +146,10 @@ export const CameraScreen = () => {
 
     return (
         <ScrollView contentContainerStyle={styles.container}>
-            {/* Visor de Cámara con Overlay corregido */}
+            {/* Visor de Cámara */}
             <View style={styles.cameraFrame}>
                 <CameraView style={styles.camera} ref={cameraRef} facing="back" />
 
-                {/* Overlay en capa absoluta independiente */}
                 <View style={styles.overlayHeader}>
                     <View
                         style={[
@@ -125,10 +166,12 @@ export const CameraScreen = () => {
                     >
                         <Text style={styles.statusBadgeText}>
                             {currentState === 'ARMED'
-                                ? '• VIGILANDO'
+                                ? isAutoDetectEnabled
+                                    ? '• DETECCIÓN AUTÓNOMA ACTIVA'
+                                    : '• VIGILANDO (MANUAL)'
                                 : currentState === 'TRIGGERED'
-                                    ? '• ALERTA'
-                                    : '• INACTIVO'}
+                                    ? '• ¡INTRUSIÓN DETECTADA!'
+                                    : '• SENSOR INACTIVO'}
                         </Text>
                     </View>
 
@@ -136,9 +179,10 @@ export const CameraScreen = () => {
                 </View>
             </View>
 
+            {/* Tarjeta de Controles y Sensores */}
             <View style={styles.controlsCard}>
                 <View style={styles.switchRow}>
-                    <Text style={styles.controlLabel}>Sensor de Cámara Activo</Text>
+                    <Text style={styles.controlLabel}>Camara de Sensor Activa</Text>
                     <Switch
                         value={isMonitoring}
                         onValueChange={setIsMonitoring}
@@ -147,9 +191,20 @@ export const CameraScreen = () => {
                     />
                 </View>
 
+                <View style={styles.switchRow}>
+                    <Text style={styles.controlLabel}>Detección Automática (Sin Botón)</Text>
+                    <Switch
+                        value={isAutoDetectEnabled}
+                        onValueChange={setIsAutoDetectEnabled}
+                        trackColor={{ false: '#424242', true: '#0288d1' }}
+                        thumbColor="#ffffff"
+                        disabled={!isMonitoring}
+                    />
+                </View>
+
                 {lastCaptureTime && (
                     <Text style={styles.lastCaptureText}>
-                        Última evidencia enviada: {lastCaptureTime}
+                        Última evidencia capturada: {lastCaptureTime}
                     </Text>
                 )}
 
@@ -158,7 +213,7 @@ export const CameraScreen = () => {
                         styles.triggerButton,
                         currentState !== 'ARMED' && styles.disabledButton,
                     ]}
-                    onPress={() => triggerIntrusionDetection('Movimiento detectado (Simulación Óptica)')}
+                    onPress={() => triggerIntrusionDetection('Movimiento forzado manualmente')}
                     disabled={currentState !== 'ARMED' || isProcessing}
                     activeOpacity={0.8}
                 >
@@ -167,7 +222,7 @@ export const CameraScreen = () => {
                     ) : (
                         <Text style={styles.triggerButtonText}>
                             {currentState === 'ARMED'
-                                ? '📷 SIMULAR DETECCIÓN DE MOVIMIENTO'
+                                ? '📷 FORZAR CAPTURA MANUAL'
                                 : '🔒 ARMA EL SISTEMA PARA ACTIVAR CÁMARA'}
                         </Text>
                     )}
@@ -254,7 +309,7 @@ const styles = StyleSheet.create({
     statusBadgeText: {
         color: '#ffffff',
         fontWeight: 'bold',
-        fontSize: 12,
+        fontSize: 11,
     },
     controlsCard: {
         width: '100%',
@@ -266,11 +321,11 @@ const styles = StyleSheet.create({
         flexDirection: 'row',
         justifyContent: 'space-between',
         alignItems: 'center',
-        marginBottom: 12,
+        marginBottom: 16,
     },
     controlLabel: {
         color: '#ffffff',
-        fontSize: 16,
+        fontSize: 15,
         fontWeight: '600',
     },
     lastCaptureText: {

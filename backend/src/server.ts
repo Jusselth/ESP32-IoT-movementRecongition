@@ -175,9 +175,16 @@ espWss.on('connection', (ws: WebSocket) => {
       const data = JSON.parse(message.toString());
       console.log('[ESP32 Native WS] 📩 Mensaje recibido:', data);
 
+      // 1. Manejar botón de armar/desarmar ('b')
       if (data.buttonPressed) {
         const nextState: SystemState = currentSystemState === 'DISARMED' ? 'ARMED' : 'DISARMED';
         await updateSystemState(nextState, 'ESP32_BUTTON');
+      }
+
+      // 2. Manejar comando de pánico / alerta de sensor ('t')
+      if (data.panicPressed) {
+        console.log('[ESP32 Native WS] 🚨 Disparo de Alerta/Pánico recibido desde el ESP32');
+        await updateSystemState('TRIGGERED', 'ESP32_PANIC_BUTTON');
       }
     } catch (err) {
       console.error('[ESP32 Native WS] Error parseando mensaje:', err);
