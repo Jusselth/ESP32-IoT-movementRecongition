@@ -1,7 +1,7 @@
 import { Platform } from 'react-native';
 
 // ⚠️ Reemplaza esta IP por la IP IPv4 de tu PC en la red local ya esta en la casa
-const LOCAL_IP = '10.181.175.123';
+const LOCAL_IP = '192.168.1.32';
 const PORT = 3000;
 
 export const API_URL = Platform.OS === 'android' && __DEV__
