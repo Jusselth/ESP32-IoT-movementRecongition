@@ -1,9 +1,6 @@
 /**
  * ============================================================================
- * FIRMWARE ESP32 - PROTAGONISTA IoT AVANZADO CON SOPORTE DE CÁMARA Y BUZZER
- * ============================================================================
- * Protocolo: WebSocket Nativo Directo (/ws/esp32)
- * Soporte: Botones físicos, Buzzer tonal, LED de estado y ESP32-CAM opcional.
+ * FIRMWARE ESP32 - PANEL IoT DEPANELIZADO (PUERTO DEDICADO 8080)
  * ============================================================================
  */
 
@@ -14,46 +11,20 @@
 // ============================================================================
 // 1. CONFIGURACIÓN DE RED Y BACKEND
 // ============================================================================
-const char* WIFI_SSID     = "TP-LINK_4F7E48";          // 👈 Reemplaza por tu red Wi-Fi
-const char* WIFI_PASSWORD = "03333129";   // 👈 Reemplaza por tu contraseña Wi-Fi
+const char* WIFI_SSID     = "TP-LINK_4F7E48";   // Tu red Wi-Fi
+const char* WIFI_PASSWORD = "03333129";        // Tu contraseña Wi-Fi
 
-// IP local de tu PC ejecutando el Backend (ej: 192.168.1.15)
-const char* SERVER_HOST   = "192.168.1.32";        // 👈 Reemplaza por la IP de tu PC
-const uint16_t SERVER_PORT = 3000;
-
-// ============================================================================
-// 2. CONFIGURACIÓN DE PINES Y HARDWARE
-// ============================================================================
-#define PIN_BUILTIN_LED 2    // LED Azul Integrado en la placa ESP32
-#define PIN_BUZZER      21   // Pin listo para conectar un Buzzer Pasivo/Activo
-#define PIN_BTN_ARM     4    // Pin listo para Botón Físico Armar/Desarmar (INPUT_PULLUP)
-#define PIN_BTN_PANIC   13   // Pin listo para Botón Físico de Pánico (INPUT_PULLUP)
-
-// Activar solo si se usa una placa ESP32-CAM (AI-Thinker OV2640)
-#define ENABLE_ESP32_CAM false
-
-#if ENABLE_ESP32_CAM
-  #include "esp_camera.h"
-  #define PWDN_GPIO_NUM    32
-  #define RESET_GPIO_NUM   -1
-  #define XCLK_GPIO_NUM     0
-  #define SIOD_GPIO_NUM    26
-  #define SIOC_GPIO_NUM    27
-  #define Y9_GPIO_NUM      35
-  #define Y8_GPIO_NUM      34
-  #define Y7_GPIO_NUM      39
-  #define Y6_GPIO_NUM      36
-  #define Y5_GPIO_NUM      21
-  #define Y4_GPIO_NUM      19
-  #define Y3_GPIO_NUM      18
-  #define Y2_GPIO_NUM       5
-  #define VSYNC_GPIO_NUM   25
-  #define HREF_GPIO_NUM    23
-  #define PCLK_GPIO_NUM    22
-#endif
+const char* SERVER_HOST   = "192.168.1.32";     // Dirección IPv4 local de tu PC
+const uint16_t SERVER_PORT = 8080;             // 👈 Puerto dedicado exclusivo para el ESP32
 
 // ============================================================================
-// 3. VARIABLES GLOBALES Y CONTROL DE ESTADOS
+// 2. CONFIGURACIÓN DE PINES
+// ============================================================================
+#define PIN_BUILTIN_LED 2    // LED Azul Integrado
+#define PIN_BOOT_BTN    0    // Botón BOOT (GPIO 0)
+
+// ============================================================================
+// 3. VARIABLES GLOBALES
 // ============================================================================
 enum SystemState { DISARMED, ARMED, TRIGGERED };
 SystemState currentState = DISARMED;
@@ -61,67 +32,38 @@ SystemState currentState = DISARMED;
 WebSocketsClient webSocket;
 bool isConnected = false;
 
-// Control de Anti-rebote para Botones Físicos (Debounce)
-int lastArmBtnState = HIGH;
-int lastPanicBtnState = HIGH;
-unsigned long lastDebounceTimeArm = 0;
-unsigned long lastDebounceTimePanic = 0;
-const unsigned long DEBOUNCE_DELAY = 50;
+int bootBtnLastState = HIGH;
+unsigned long bootPressStartTime = 0;
+bool bootLongPressHandled = false;
 
-// Temporizadores no bloqueantes
+const unsigned long SHORT_PRESS_MAX_MS = 1200;
+const unsigned long LONG_PRESS_MIN_MS  = 1500;
+const unsigned long DEBOUNCE_DELAY     = 50;
+
 unsigned long lastBlinkTime = 0;
 bool blinkState = false;
 unsigned long lastTelemetryTime = 0;
 const unsigned long TELEMETRY_INTERVAL = 10000;
 
-// Declaraciones previas
-void updateHardwareState(SystemState previousState);
+void updateHardwareState();
 void processTriggeredBlink();
-void playToneSound(String type);
 void sendTelemetry(bool buttonPressed = false, bool panicPressed = false);
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length);
-void handlePhysicalButtons();
+void handleBootButton();
 void handleSerialCommands();
 
 // ============================================================================
-// 4. EFECTOS AUDITIVOS CON BUZZER
+// 4. CONTROL DE ACTUADORES
 // ============================================================================
-void playToneSound(String type) {
-  if (type == "ARM") {
-    // Tono de Armado: Bip-Bip agudo
-    tone(PIN_BUZZER, 1000, 100);
-    delay(120);
-    tone(PIN_BUZZER, 1500, 150);
-  } else if (type == "DISARM") {
-    // Tono de Desarmado: Bip grave descendente
-    tone(PIN_BUZZER, 800, 200);
-    delay(220);
-    tone(PIN_BUZZER, 400, 300);
-  } else if (type == "PANIC") {
-    // Tono de Pánico de emergencia
-    tone(PIN_BUZZER, 2000, 400);
-  }
-}
-
-// ============================================================================
-// 5. CONTROL DE ACTUADORES Y LEDS
-// ============================================================================
-void updateHardwareState(SystemState previousState) {
+void updateHardwareState() {
   switch (currentState) {
     case DISARMED:
       digitalWrite(PIN_BUILTIN_LED, LOW);
-      noTone(PIN_BUZZER);
-      if (previousState != DISARMED) playToneSound("DISARM");
       break;
-
     case ARMED:
       digitalWrite(PIN_BUILTIN_LED, HIGH);
-      noTone(PIN_BUZZER);
-      if (previousState != ARMED) playToneSound("ARM");
       break;
-
     case TRIGGERED:
-      if (previousState != TRIGGERED) playToneSound("PANIC");
       break;
   }
 }
@@ -129,24 +71,16 @@ void updateHardwareState(SystemState previousState) {
 void processTriggeredBlink() {
   if (currentState == TRIGGERED) {
     unsigned long currentMillis = millis();
-    if (currentMillis - lastBlinkTime >= 100) { // Parpadeo estroboscópico (100ms)
+    if (currentMillis - lastBlinkTime >= 100) {
       lastBlinkTime = currentMillis;
       blinkState = !blinkState;
-
       digitalWrite(PIN_BUILTIN_LED, blinkState ? HIGH : LOW);
-      
-      // Sonido de sirena intermitente
-      if (blinkState) {
-        tone(PIN_BUZZER, 1800);
-      } else {
-        tone(PIN_BUZZER, 1200);
-      }
     }
   }
 }
 
 // ============================================================================
-// 6. ENVÍO DE TELEMETRÍA Y EVENTOS AL BACKEND
+// 5. TELEMETRÍA Y EVENTOS
 // ============================================================================
 void sendTelemetry(bool buttonPressed, bool panicPressed) {
   if (!isConnected) return;
@@ -154,7 +88,7 @@ void sendTelemetry(bool buttonPressed, bool panicPressed) {
   #if ARDUINOJSON_VERSION_MAJOR >= 7
     JsonDocument doc;
   #else
-    StaticJsonDocument<300> doc;
+    StaticJsonDocument<256> doc;
   #endif
 
   doc["type"] = "telemetry";
@@ -162,40 +96,25 @@ void sendTelemetry(bool buttonPressed, bool panicPressed) {
   doc["wifiRssi"] = WiFi.RSSI();
   doc["uptimeSeconds"] = millis() / 1000;
   doc["freeHeap"] = ESP.getFreeHeap();
-  doc["cameraConfigured"] = ENABLE_ESP32_CAM;
 
-  if (buttonPressed) {
-    doc["buttonPressed"] = true;
-  }
-
-  if (panicPressed) {
-    doc["panicPressed"] = true;
-  }
+  if (buttonPressed) doc["buttonPressed"] = true;
+  if (panicPressed) doc["panicPressed"] = true;
 
   String output;
   serializeJson(doc, output);
   webSocket.sendTXT(output);
-  Serial.println("[ESP32 Telemetry] 📤 Telemetría enviada al servidor");
+  Serial.println("[ESP32 Telemetry] 📤 Evento enviado");
 }
 
-// ============================================================================
-// 7. EVENTOS DEL WEBSOCKET NATIVO
-// ============================================================================
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
   switch (type) {
     case WStype_DISCONNECTED:
-      Serial.println("[ESP32 WS] 🔴 Desconectado del Servidor WebSocket");
+      Serial.println("[ESP32 WS] 🔴 Desconectado del Servidor");
       isConnected = false;
       break;
 
     case WStype_CONNECTED:
-      Serial.printf("[ESP32 WS] 🟢 Conectado exitosamente a: %s\n", payload);
-      Serial.println("\n-----------------------------------------------------");
-      Serial.println("💻 COMANDOS DISPONIBLES EN CONSOLA:");
-      Serial.println("  'b' -> Simular Botón Armar/Desarmar");
-      Serial.println("  't' -> Simular Botón de Pánico / Sensor de Movimiento");
-      Serial.println("  's' -> Mostrar Diagnóstico Completo del Hardware");
-      Serial.println("-----------------------------------------------------\n");
+      Serial.printf("[ESP32 WS] 🟢 CONEXIÓN INSTANTÁNEA ESTABLECIDA a: %s\n", payload);
       isConnected = true;
       sendTelemetry(false, false);
       break;
@@ -215,9 +134,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
       String msgType = doc["type"].as<String>();
       if (msgType == "status_changed") {
         String newStateStr = doc["state"].as<String>();
-        SystemState previous = currentState;
-
-        Serial.printf("[ESP32 WS] 🔄 Cambio de Estado Recibido: %s\n", newStateStr.c_str());
+        Serial.printf("[ESP32 WS] 🔄 Estado Recibido: %s\n", newStateStr.c_str());
 
         if (newStateStr == "ARMED") {
           currentState = ARMED;
@@ -227,7 +144,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
           currentState = DISARMED;
         }
 
-        updateHardwareState(previous);
+        updateHardwareState();
       }
       break;
     }
@@ -237,91 +154,56 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
   }
 }
 
-// ============================================================================
-// 8. LECTURA Y MANEJO DE BOTONES FÍSICOS
-// ============================================================================
-void handlePhysicalButtons() {
-  // 1. Botón Armar/Desarmar (GPIO 4)
-  int armReading = digitalRead(PIN_BTN_ARM);
-  if (armReading != lastArmBtnState) {
-    lastDebounceTimeArm = millis();
-  }
-  if ((millis() - lastDebounceTimeArm) > DEBOUNCE_DELAY) {
-    static int armBtnState = HIGH;
-    if (armReading != armBtnState) {
-      armBtnState = armReading;
-      if (armBtnState == LOW) { // Pulsado a GND
-        Serial.println("[ESP32 Hardware] 🔘 Botón físico (GPIO 4) presionado.");
-        sendTelemetry(true, false);
-      }
-    }
-  }
-  lastArmBtnState = armReading;
+void handleBootButton() {
+  int bootReading = digitalRead(PIN_BOOT_BTN);
 
-  // 2. Botón de Pánico / Emergencia (GPIO 13)
-  int panicReading = digitalRead(PIN_BTN_PANIC);
-  if (panicReading != lastPanicBtnState) {
-    lastDebounceTimePanic = millis();
+  if (bootReading == LOW && bootBtnLastState == HIGH) {
+    bootPressStartTime = millis();
+    bootLongPressHandled = false;
   }
-  if ((millis() - lastDebounceTimePanic) > DEBOUNCE_DELAY) {
-    static int panicBtnState = HIGH;
-    if (panicReading != panicBtnState) {
-      panicBtnState = panicReading;
-      if (panicBtnState == LOW) { // Pulsado a GND
-        Serial.println("[ESP32 Hardware] 🚨 Botón de Pánico (GPIO 13) presionado.");
-        sendTelemetry(false, true);
-      }
+
+  if (bootReading == LOW) {
+    unsigned long holdDuration = millis() - bootPressStartTime;
+    if (!bootLongPressHandled && holdDuration >= LONG_PRESS_MIN_MS) {
+      Serial.println("[ESP32 Hardware] 🚨 PULSACIÓN LARGA -> PÁNICO");
+      sendTelemetry(false, true);
+      bootLongPressHandled = true;
     }
   }
-  lastPanicBtnState = panicReading;
+
+  if (bootReading == HIGH && bootBtnLastState == LOW) {
+    unsigned long holdDuration = millis() - bootPressStartTime;
+    if (!bootLongPressHandled && holdDuration >= DEBOUNCE_DELAY && holdDuration < SHORT_PRESS_MAX_MS) {
+      Serial.println("[ESP32 Hardware] 🔘 PULSACIÓN CORTA -> Armar/Desarmar");
+      sendTelemetry(true, false);
+    }
+  }
+
+  bootBtnLastState = bootReading;
 }
 
-// ============================================================================
-// 9. COMANDOS DE PRUEBA POR MONITOR SERIE
-// ============================================================================
 void handleSerialCommands() {
   if (Serial.available() > 0) {
     char ch = Serial.read();
-
     if (ch == 'b' || ch == 'B') {
-      Serial.println("[ESP32 Console] 🔘 Comando 'b': Conmutar Armado/Desarmado");
       sendTelemetry(true, false);
     } else if (ch == 't' || ch == 'T') {
-      Serial.println("[ESP32 Console] 🚨 Comando 't': Disparar Alerta / Pánico");
       sendTelemetry(false, true);
-    } else if (ch == 's' || ch == 'S') {
-      Serial.println("\n📊 --- DIAGNÓSTICO DEL SISTEMA ESP32 ---");
-      Serial.printf("  • Estado Actual: %s\n", currentState == ARMED ? "ARMED" : currentState == TRIGGERED ? "TRIGGERED" : "DISARMED");
-      Serial.printf("  • IP Asignada: %s\n", WiFi.localIP().toString().c_str());
-      Serial.printf("  • Nivel Señal Wi-Fi: %d dBm\n", WiFi.RSSI());
-      Serial.printf("  • RAM Libre: %u Bytes\n", ESP.getFreeHeap());
-      Serial.printf("  • Conexión WebSocket: %s\n", isConnected ? "🟢 CONECTADO" : "🔴 DESCONECTADO");
-      Serial.printf("  • Módulo ESP32-CAM: %s\n", ENABLE_ESP32_CAM ? "ACTIVADO" : "DESACTIVADO");
-      Serial.println("-----------------------------------------\n");
     }
   }
 }
 
 // ============================================================================
-// 10. SETUP E INICIALIZACIÓN
+// 6. SETUP E INICIALIZACIÓN
 // ============================================================================
 void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  Serial.println("\n=====================================================");
-  Serial.println("🚀 Panel IoT ESP32 Avanzado Iniciando...");
-  Serial.println("=====================================================");
-
-  // Configuración de Pines de Salida y Entrada
   pinMode(PIN_BUILTIN_LED, OUTPUT);
-  pinMode(PIN_BUZZER, OUTPUT);
-  pinMode(PIN_BTN_ARM, INPUT_PULLUP);
-  pinMode(PIN_BTN_PANIC, INPUT_PULLUP);
+  pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
+  updateHardwareState();
 
-  updateHardwareState(DISARMED);
-
-  // Conexión Wi-Fi
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("[Wi-Fi] Conectando a ");
   Serial.print(WIFI_SSID);
@@ -331,22 +213,22 @@ void setup() {
     Serial.print(".");
   }
 
+  // 👈 CLAVE: Desactivar ahorro de energía para garantizar conexión inmediata
+  WiFi.setSleep(false);
+
   Serial.println("\n[Wi-Fi] 🟢 Conectado exitosamente.");
   Serial.print("[Wi-Fi] IP Asignada: ");
   Serial.println(WiFi.localIP());
 
-  // Iniciar cliente WebSocket
+  // Iniciar cliente WebSocket en la ruta directa del puerto 8080
   webSocket.begin(SERVER_HOST, SERVER_PORT, "/ws/esp32");
   webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(5000);
+  webSocket.setReconnectInterval(2000);
 }
 
-// ============================================================================
-// 11. BUCLE PRINCIPAL
-// ============================================================================
 void loop() {
   webSocket.loop();
-  handlePhysicalButtons();
+  handleBootButton();
   handleSerialCommands();
   processTriggeredBlink();
 

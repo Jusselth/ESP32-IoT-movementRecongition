@@ -23,29 +23,51 @@ export const CameraScreen = () => {
     const [isProcessing, setIsProcessing] = useState<boolean>(false);
     const [lastCaptureTime, setLastCaptureTime] = useState<string | null>(null);
 
-    // Guardar hash del fotograma anterior para detectar movimiento
+    // Banderas de control de estado sin re-renders
+    const isProcessingRef = useRef<boolean>(false);
+    const isCooldownRef = useRef<boolean>(false);
     const previousFrameHashRef = useRef<number | null>(null);
 
     const status = useSystemStore((state) => state.status);
     const reportAlert = useSystemStore((state) => state.reportAlert);
     const currentState: SystemState = status?.state || 'DISARMED';
 
-    // Función principal para reportar alertas en ráfaga (3 imágenes a 0.5s)
-    const triggerIntrusionDetection = async (reason = 'Detección automática de movimiento') => {
-        if (isProcessing) return;
-
-        if (currentState !== 'ARMED') {
-            return;
-        }
+    // Función principal para reportar alertas en ráfaga (Foto 1 Instantánea + Fotos)
+    const triggerIntrusionDetection = async (
+        reason = 'Detección automática de movimiento',
+        firstFrameBase64?: string
+    ) => {
+        if (isProcessingRef.current || isCooldownRef.current) return;
+        if (currentState !== 'ARMED') return;
 
         try {
+            isProcessingRef.current = true;
+            isCooldownRef.current = true; // Activar bloqueo inmediato para evitar alertas consecutivas
             setIsProcessing(true);
 
-            if (cameraRef.current) {
-                const capturedImages: string[] = [];
+            const capturedImages: string[] = [];
 
-                // Capturar 3 fotogramas consecutivos con 0.5s de pausa
-                for (let i = 0; i < 3; i++) {
+            // 📸 Foto 1: Usar directamente el fotograma que disparó la alerta (LATENCIA CERO)
+            if (firstFrameBase64) {
+                const cleanBase64 = firstFrameBase64.replace(/[\r\n]/g, '');
+                capturedImages.push(cleanBase64);
+                console.log(`[Camera Burst] 📸 Foto 1/7 capturada instantáneamente (Sensor)`);
+            } else if (cameraRef.current) {
+                const photo1 = await cameraRef.current.takePictureAsync({
+                    base64: true,
+                    quality: 0.2,
+                    shutterSound: false,
+                });
+                if (photo1?.base64) {
+                    capturedImages.push(photo1.base64.replace(/[\r\n]/g, ''));
+                    console.log(`[Camera Burst] 📸 Foto 1/7 capturada`);
+                }
+            }
+
+            // Captura secuencial con 100ms de diferencia
+            for (let i = capturedImages.length; i < 7; i++) {
+                await delay(100);
+                if (cameraRef.current) {
                     const photo = await cameraRef.current.takePictureAsync({
                         base64: true,
                         quality: 0.2,
@@ -55,52 +77,65 @@ export const CameraScreen = () => {
                     if (photo?.base64) {
                         const cleanBase64 = photo.base64.replace(/[\r\n]/g, '');
                         capturedImages.push(cleanBase64);
-                        console.log(`[Camera Burst] 📸 Foto ${i + 1}/3 capturada`);
-                    }
-
-                    if (i < 2) {
-                        await delay(500); // Pausa de 500ms entre tomas
+                        console.log(`[Camera Burst] 📸 Foto ${i + 1}/7 capturada`);
                     }
                 }
+            }
 
-                if (capturedImages.length > 0) {
-                    const timestamp = new Date().toISOString();
-                    setLastCaptureTime(new Date().toLocaleTimeString());
+            if (capturedImages.length > 0) {
+                const timestamp = new Date().toISOString();
+                setLastCaptureTime(new Date().toLocaleTimeString());
 
-                    await reportAlert({
-                        triggerSource: 'MOBILE_CAMERA',
-                        timestamp,
-                        imagesBase64: capturedImages,          // Arreglo completo de ráfaga
-                        imageBase64: capturedImages[0],        // Respaldo de foto individual
-                        additionalInfo: `${reason} (Ráfaga de ${capturedImages.length} tomas a 0.5s)`,
-                    });
-                }
+                await reportAlert({
+                    triggerSource: 'MOBILE_CAMERA',
+                    timestamp,
+                    imagesBase64: capturedImages,
+                    imageBase64: capturedImages[0],
+                    additionalInfo: `${reason} (Ráfaga de ${capturedImages.length} tomas)`,
+                });
             }
         } catch (error) {
             console.error('[Camera] Error al capturar ráfaga de evidencia:', error);
         } finally {
             setIsProcessing(false);
+            isProcessingRef.current = false;
+
+            // Mantener ventana de Cooldown de 8 segundos antes de permitir una nueva detección
+            setTimeout(() => {
+                isCooldownRef.current = false;
+                previousFrameHashRef.current = null;
+                console.log('[Camera] 🟢 Cooldown finalizado. Reanudando sensor óptico.');
+            }, 8000);
         }
     };
 
-    // Algoritmo de detección óptica automática corregido
+    // Algoritmo de detección recursiva por setTimeout (Sin solapamiento)
     useEffect(() => {
-        let autoDetectInterval: NodeJS.Timeout | null = null;
+        let timeoutId: NodeJS.Timeout | null = null;
+        let isMounted = true;
 
-        if (currentState === 'ARMED' && isMonitoring && isAutoDetectEnabled) {
-            autoDetectInterval = setInterval(async () => {
-                if (isProcessing || !cameraRef.current) return;
+        const runAutoDetection = async () => {
+            if (!isMounted) return;
 
+            if (
+                currentState === 'ARMED' &&
+                isMonitoring &&
+                isAutoDetectEnabled &&
+                !isProcessingRef.current &&
+                !isCooldownRef.current
+            ) {
                 try {
-                    const frame = await cameraRef.current.takePictureAsync({
+                    const frame = await cameraRef.current?.takePictureAsync({
                         base64: true,
-                        quality: 0.1,
+                        quality: 0.2,
                         shutterSound: false,
                     });
 
-                    if (frame?.base64) {
-                        // Muestreo de la cadena Base64
-                        const sampleString = frame.base64.substring(200, 1200);
+                    if (frame?.base64 && isMounted) {
+                        // Muestreo distribuido del fotograma (inicio y centro de la cadena)
+                        const b64 = frame.base64;
+                        const sampleString = b64.substring(200, 800) + b64.substring(1200, 1800);
+
                         let currentHash = 0;
                         for (let i = 0; i < sampleString.length; i++) {
                             currentHash += sampleString.charCodeAt(i);
@@ -109,32 +144,40 @@ export const CameraScreen = () => {
                         if (previousFrameHashRef.current !== null) {
                             const delta = Math.abs(currentHash - previousFrameHashRef.current);
 
-                            // Muestra el cambio detectado en la consola para calibrar
-                            console.log(`[AutoDetect] 🔍 Nivel de movimiento detectado (Delta): ${delta}`);
-
-                            // Umbral calibrado (Valores > 600 indican movimiento frente al lente)
-                            if (delta > 600) {
-                                console.log(`[AutoDetect] 🚨 ¡Movimiento superó el umbral! Disparando alerta...`);
+                            // Umbral de sensibilidad ajustado
+                            if (delta > 1950) {
+                                console.log(`[AutoDetect] 🚨 ¡Entrada detectada! Delta: ${delta}`);
                                 previousFrameHashRef.current = null;
-                                await triggerIntrusionDetection('🚨 Movimiento óptico detectado automáticamente');
-                                return;
+                                // Disparar pasando la imagen capturada para reusarla de inmediato
+                                await triggerIntrusionDetection('🚨 Movimiento óptico detectado', frame.base64);
+                                return; // Sale del ciclo mientras dure el Cooldown
                             }
                         }
 
                         previousFrameHashRef.current = currentHash;
                     }
                 } catch (err) {
-                    // Ignorar pequeños fallos de ciclo
+                    // Ignorar errores puntuales de lectura de lente
                 }
-            }, 825);
+            }
+
+            // Programar el siguiente ciclo solo cuando el fotograma actual se haya completado
+            if (isMounted && currentState === 'ARMED' && !isCooldownRef.current) {
+                timeoutId = setTimeout(runAutoDetection, 250);
+            }
+        };
+
+        if (currentState === 'ARMED' && isMonitoring && isAutoDetectEnabled) {
+            runAutoDetection();
         } else {
             previousFrameHashRef.current = null;
         }
 
         return () => {
-            if (autoDetectInterval) clearInterval(autoDetectInterval);
+            isMounted = false;
+            if (timeoutId) clearTimeout(timeoutId);
         };
-    }, [currentState, isMonitoring, isAutoDetectEnabled, isProcessing]);
+    }, [currentState, isMonitoring, isAutoDetectEnabled]);
 
     if (!permission) {
         return (

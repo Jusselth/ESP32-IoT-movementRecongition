@@ -132,13 +132,13 @@ export async function updateSystemState(newState: SystemState, source: string): 
 }
 
 // ============================================================================
-// 3. CONFIGURACIÓN DEL SERVIDOR EXPRESS, SOCKET.IO Y WEBSOCKET NATIVO ESP32
+// 3. CONFIGURACIÓN DEL SERVIDOR EXPRESS, SOCKET.IO Y WEBSOCKET DEDICADO ESP32
 // ============================================================================
 
 const app = express();
 const server = http.createServer(app);
 
-// Socket.IO para App Móvil
+// Socket.IO para App Móvil en Puerto 3000
 const io = new Server<ClientToServerEvents, ServerToClientEvents>(server, {
   cors: {
     origin: '*',
@@ -146,23 +146,13 @@ const io = new Server<ClientToServerEvents, ServerToClientEvents>(server, {
   },
 });
 
-// WebSocket Nativo para ESP32
-const espWss = new WebSocketServer({ noServer: true });
-
-server.on('upgrade', (request, socket, head) => {
-  const pathname = request.url;
-
-  if (pathname === '/ws/esp32') {
-    espWss.handleUpgrade(request, socket, head, (ws) => {
-      espWss.emit('connection', ws, request);
-    });
-  }
-});
+// WebSocket Nativo Independiente para ESP32 en Puerto 8080
+const ESP32_PORT = 8080;
+const espWss = new WebSocketServer({ port: ESP32_PORT, path: '/ws/esp32' });
 
 espWss.on('connection', (ws: WebSocket) => {
-  console.log('[ESP32 Native WS] 🔌 ESP32 Conectado por WebSocket Nativo');
+  console.log('[ESP32 Native WS] 🔌 ESP32 Conectado por el puerto dedicado 8080');
 
-  // Enviar estado actual al conectar
   ws.send(JSON.stringify({
     type: 'status_changed',
     state: currentSystemState,
@@ -174,13 +164,11 @@ espWss.on('connection', (ws: WebSocket) => {
       const data = JSON.parse(message.toString());
       console.log('[ESP32 Native WS] 📩 Mensaje recibido:', data);
 
-      // 1. Manejar botón de armar/desarmar ('b')
       if (data.buttonPressed) {
         const nextState: SystemState = currentSystemState === 'DISARMED' ? 'ARMED' : 'DISARMED';
         await updateSystemState(nextState, 'ESP32_BUTTON');
       }
 
-      // 2. Manejar comando de pánico / alerta de sensor ('t')
       if (data.panicPressed) {
         console.log('[ESP32 Native WS] 🚨 Disparo de Alerta/Pánico recibido desde el ESP32');
         await updateSystemState('TRIGGERED', 'ESP32_PANIC_BUTTON');
@@ -192,6 +180,10 @@ espWss.on('connection', (ws: WebSocket) => {
 
   ws.on('close', () => {
     console.log('[ESP32 Native WS] 🔴 ESP32 Desconectado');
+  });
+
+  ws.on('error', (err) => {
+    console.error('[ESP32 Native WS] ⚠️ Error en socket ESP32:', err);
   });
 });
 
@@ -243,7 +235,6 @@ app.post('/api/alert', async (req: Request, res: Response) => {
 
   const alertId = `alert_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-  // Procesar arreglo de imágenes Base64 (admite ráfaga 'imagesBase64' o foto única 'imageBase64')
   let formattedImages: string[] = [];
   if (body.imagesBase64 && Array.isArray(body.imagesBase64) && body.imagesBase64.length > 0) {
     formattedImages = body.imagesBase64.map((img) => {
@@ -261,8 +252,8 @@ app.post('/api/alert', async (req: Request, res: Response) => {
     id: alertId,
     timestamp: alertTimestamp,
     triggerSource,
-    evidenceUrl: formattedImages[0] || undefined, // Primera foto para vista rápida
-    evidenceUrls: formattedImages,                // Arreglo completo con la ráfaga de fotos
+    evidenceUrl: formattedImages[0] || undefined,
+    evidenceUrls: formattedImages,
     emailSent: false,
     emailRecipient: recipientEmail,
     notes: body.additionalInfo,
@@ -270,7 +261,6 @@ app.post('/api/alert', async (req: Request, res: Response) => {
 
   await insertIntrusionLogToDb(intrusionLog);
 
-  // Transmitir el DTO con la ráfaga completa al servicio de correo
   sendIntrusionAlertEmail(intrusionLog, body)
     .then(async (emailSuccess: boolean) => {
       intrusionLog.emailSent = emailSuccess;
@@ -332,13 +322,15 @@ async function startServer() {
 
   scheduleConfig = await fetchScheduleConfigFromDb();
 
-  const PORT = config.port;
-  server.listen(PORT, () => {
+  const PORT = config.port || 3000;
+  const HOST = '0.0.0.0';
+
+  server.listen(PORT, HOST, () => {
     console.log(`
 =====================================================
 🚀 Backend Servidor IoT iniciado exitosamente
-📡 Puerto HTTP/Socket.IO: ${PORT}
-🔌 Endpoint WebSocket ESP32: ws://localhost:${PORT}/ws/esp32
+📡 Puerto HTTP/Socket.IO (App Móvil): http://${HOST}:${PORT}
+🔌 Puerto WebSocket Dedicado (ESP32): ws://192.168.1.32:${ESP32_PORT}/ws/esp32
 🛢️ Persistencia: Supabase PostgreSQL Conectado
 =====================================================
     `);
